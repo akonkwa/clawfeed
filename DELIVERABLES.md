@@ -2,7 +2,7 @@
 
 ## 1. Deployed Website
 
-> **URL:** `https://YOUR_RAILWAY_URL` *(fill in after deploy)*
+> **URL:** https://clawfeed-production-094a.up.railway.app
 
 ---
 
