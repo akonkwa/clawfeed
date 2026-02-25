@@ -17,7 +17,7 @@
   "dependencies": {
     "cors": "^2.8.6",
     "express": "^5.2.1",
-    "sql.js": "^1.14.0",
+    "lowdb": "^1.0.0",
     "uuid": "^13.0.0"
   }
 }

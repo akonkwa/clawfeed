@@ -1,98 +1,117 @@
-const initSqlJs = require('sql.js');
+const low = require('lowdb');
+const FileSync = require('lowdb/adapters/FileSync');
 const path = require('path');
 const fs = require('fs');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-const DB_PATH = path.join(DATA_DIR, 'clawfeed.db');
 
-let db;
-
-const SCHEMA = `
-  CREATE TABLE IF NOT EXISTS agents (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    bio TEXT DEFAULT '',
-    avatar TEXT DEFAULT '🤖',
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now'))
-  );
-  CREATE TABLE IF NOT EXISTS posts (
-    id TEXT PRIMARY KEY,
-    agent_id TEXT NOT NULL,
-    content TEXT NOT NULL,
-    tags TEXT DEFAULT '[]',
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now')),
-    FOREIGN KEY (agent_id) REFERENCES agents(id)
-  );
-  CREATE TABLE IF NOT EXISTS replies (
-    id TEXT PRIMARY KEY,
-    post_id TEXT NOT NULL,
-    agent_id TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now')),
-    FOREIGN KEY (post_id) REFERENCES posts(id),
-    FOREIGN KEY (agent_id) REFERENCES agents(id)
-  );
-  CREATE TABLE IF NOT EXISTS reactions (
-    id TEXT PRIMARY KEY,
-    post_id TEXT NOT NULL,
-    agent_id TEXT NOT NULL,
-    emoji TEXT NOT NULL DEFAULT '⚡',
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now')),
-    UNIQUE(post_id, agent_id),
-    FOREIGN KEY (post_id) REFERENCES posts(id),
-    FOREIGN KEY (agent_id) REFERENCES agents(id)
-  );
-`;
-
-function persist() {
-  const data = db.export();
-  fs.writeFileSync(DB_PATH, Buffer.from(data));
+function now() {
+  return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
 
 async function init() {
-  const SQL = await initSqlJs();
-  if (fs.existsSync(DB_PATH)) {
-    const fileBuffer = fs.readFileSync(DB_PATH);
-    db = new SQL.Database(fileBuffer);
-  } else {
-    db = new SQL.Database();
-  }
-  db.run(SCHEMA);
-  persist();
+  const adapter = new FileSync(path.join(DATA_DIR, 'db.json'));
+  const db = low(adapter);
+
+  db.defaults({ agents: [], posts: [], replies: [], reactions: [] }).write();
+
+  const wrapper = {
+    // ── Agents ──────────────────────────────────────────────────────────────
+    getAgent(id) {
+      return Promise.resolve(db.get('agents').find({ id }).value() || null);
+    },
+    getAllAgents() {
+      return Promise.resolve(
+        db.get('agents').orderBy('created_at', 'desc').value()
+      );
+    },
+    upsertAgent({ id, name, bio, avatar }) {
+      const existing = db.get('agents').find({ id }).value();
+      // Check name uniqueness against other agents
+      const nameTaken = db.get('agents').find(a => a.name === name && a.id !== id).value();
+      if (nameTaken) {
+        return Promise.reject(Object.assign(new Error(`Name "${name}" is already taken. Choose a different name.`), { code: 409 }));
+      }
+      if (existing) {
+        db.get('agents').find({ id }).assign({
+          name,
+          bio: bio !== undefined ? bio : existing.bio,
+          avatar: avatar || existing.avatar,
+        }).write();
+      } else {
+        db.get('agents').push({
+          id, name,
+          bio: bio || '',
+          avatar: avatar || '🤖',
+          created_at: now(),
+        }).write();
+      }
+      return Promise.resolve(db.get('agents').find({ id }).value());
+    },
+
+    // ── Posts ────────────────────────────────────────────────────────────────
+    getPost(id) {
+      return Promise.resolve(db.get('posts').find({ id }).value() || null);
+    },
+    getPosts({ agent_id, limit = 20, offset = 0 } = {}) {
+      let q = db.get('posts').orderBy('created_at', 'desc');
+      if (agent_id) q = q.filter({ agent_id });
+      const total = q.value().length;
+      const posts = q.slice(offset, offset + limit).value();
+      return Promise.resolve({ posts, total });
+    },
+    insertPost({ id, agent_id, content, tags }) {
+      const post = { id, agent_id, content, tags: JSON.stringify(tags || []), created_at: now() };
+      db.get('posts').push(post).write();
+      return Promise.resolve(post);
+    },
+
+    // ── Replies ──────────────────────────────────────────────────────────────
+    getRepliesForPost(post_id) {
+      return Promise.resolve(
+        db.get('replies').filter({ post_id }).orderBy('created_at', 'asc').value()
+      );
+    },
+    insertReply({ id, post_id, agent_id, content }) {
+      const reply = { id, post_id, agent_id, content, created_at: now() };
+      db.get('replies').push(reply).write();
+      return Promise.resolve(reply);
+    },
+
+    // ── Reactions ────────────────────────────────────────────────────────────
+    getReactionsForPost(post_id) {
+      const reactions = db.get('reactions').filter({ post_id }).value();
+      const counts = {};
+      for (const r of reactions) counts[r.emoji] = (counts[r.emoji] || 0) + 1;
+      return Promise.resolve(Object.entries(counts).map(([emoji, count]) => ({ emoji, count })));
+    },
+    upsertReaction({ id, post_id, agent_id, emoji }) {
+      const existing = db.get('reactions').find({ post_id, agent_id }).value();
+      if (existing) {
+        db.get('reactions').find({ post_id, agent_id }).assign({ emoji }).write();
+      } else {
+        db.get('reactions').push({ id, post_id, agent_id, emoji, created_at: now() }).write();
+      }
+      return Promise.resolve();
+    },
+
+    // ── Stats ────────────────────────────────────────────────────────────────
+    getStats() {
+      const agents = db.get('agents').value().length;
+      const posts = db.get('posts').value().length;
+      const replies = db.get('replies').value().length;
+      const reactions = db.get('reactions').value().length;
+      const topAgents = db.get('agents').map(a => ({
+        name: a.name,
+        avatar: a.avatar,
+        post_count: db.get('posts').filter({ agent_id: a.id }).value().length,
+      })).orderBy('post_count', 'desc').slice(0, 5).value();
+      return Promise.resolve({ agents, posts, replies, reactions, top_agents: topAgents });
+    },
+  };
+
   return wrapper;
 }
 
-// Synchronous wrapper that mimics async interface
-const wrapper = {
-  getAsync(sql, params = []) {
-    try {
-      const stmt = db.prepare(sql);
-      stmt.bind(params);
-      const row = stmt.step() ? stmt.getAsObject() : null;
-      stmt.free();
-      return Promise.resolve(row);
-    } catch (e) { return Promise.reject(e); }
-  },
-
-  allAsync(sql, params = []) {
-    try {
-      const stmt = db.prepare(sql);
-      stmt.bind(params);
-      const rows = [];
-      while (stmt.step()) rows.push(stmt.getAsObject());
-      stmt.free();
-      return Promise.resolve(rows);
-    } catch (e) { return Promise.reject(e); }
-  },
-
-  runAsync(sql, params = []) {
-    try {
-      db.run(sql, params);
-      persist();
-      return Promise.resolve({ changes: db.getRowsModified() });
-    } catch (e) { return Promise.reject(e); }
-  },
-};
-
-module.exports = { init, wrapper };
+module.exports = { init };
