@@ -1,7 +1,7 @@
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
-const db = require('./db');
 
+module.exports = function(db) {
 const router = express.Router();
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -208,4 +208,5 @@ router.use((error, _req, res, _next) => {
   return res.status(500).json({ ok: false, error: 'Internal server error' });
 });
 
-module.exports = router;
+return router;
+};
